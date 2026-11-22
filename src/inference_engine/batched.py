@@ -10,7 +10,7 @@ from collections import defaultdict
 class LengthGroupedTransformersBackend:
     """Real batched tensor forwards within groups of identical context length."""
 
-    def __init__(self, model_name="sshleifer/tiny-gpt2", device=None, *, model=None, tokenizer=None):
+    def __init__(self, model_name="sshleifer/tiny-gpt2", device=None, *, model=None, tokenizer=None, kv_store=None):
         import torch
         self.torch = torch
         if model is None or tokenizer is None:
@@ -26,6 +26,7 @@ class LengthGroupedTransformersBackend:
             self.model.eval()
         self.eos_token_id = tokenizer.eos_token_id
         self._states = {}
+        self.kv_store = kv_store
         self.forward_calls = 0
 
     def encode(self, text):
@@ -45,6 +46,8 @@ class LengthGroupedTransformersBackend:
 
     def release(self, request_id):
         self._states.pop(request_id, None)
+        if self.kv_store is not None:
+            self.kv_store.release(request_id)
 
     @staticmethod
     def _legacy_cache(cache):
@@ -75,11 +78,12 @@ class LengthGroupedTransformersBackend:
                 past = None
             else:
                 token_rows = [[seq[-1]] for _, _, seq, _ in batch]
+                pasts = [self.kv_store.read(request_id) if self.kv_store is not None
+                         else state["past"] for _, request_id, _, state in batch]
                 past = tuple(
-                    tuple(self.torch.cat([state["past"][layer][part]
-                                          for _, _, _, state in batch], dim=0)
+                    tuple(self.torch.cat([item[layer][part] for item in pasts], dim=0)
                           for part in range(2))
-                    for layer in range(len(batch[0][3]["past"]))
+                    for layer in range(len(pasts[0]))
                 )
             ids = self.torch.tensor(token_rows, dtype=self.torch.long, device=self.device)
             mask = self.torch.ones((len(batch), len(batch[0][2])), dtype=self.torch.long, device=self.device)
@@ -93,9 +97,12 @@ class LengthGroupedTransformersBackend:
                 raise RuntimeError("model output batch size mismatch")
             for row, (i, request_id, seq, _) in enumerate(batch):
                 results[i] = int(tokens[row])
+                single_cache = tuple(tuple(kv[row:row + 1].contiguous() for kv in layer)
+                                     for layer in cache)
+                if self.kv_store is not None:
+                    self.kv_store.write(request_id, single_cache)
                 self._states[request_id] = {
                     "history": list(seq), "length": len(seq),
-                    "past": tuple(tuple(kv[row:row + 1].contiguous() for kv in layer)
-                                  for layer in cache),
+                    "past": None if self.kv_store is not None else single_cache,
                 }
         return results
