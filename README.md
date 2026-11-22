@@ -2,7 +2,7 @@
 
 A runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block metadata allocator**, optional Hugging Face Transformers generation backends, and **length-grouped real tensor batching**.
 
-> **Implementation status:** This repository is an educational prototype, **not** a production GPU inference engine. The metadata allocator is not connected to attention KV tensors. There are no custom CUDA kernels, GPU paged attention, prefix sharing, speculative decoding, or validated Qwen3-8B performance claims in this version.
+> **Implementation status:** This repository is an educational prototype, **not** a production GPU inference engine. The optional tensor block store is connected to the length-grouped backend, but reconstructs contiguous KV caches for ordinary attention. There are no custom CUDA kernels, GPU paged attention, prefix sharing, speculative decoding, or validated Qwen3-8B performance claims in this version.
 
 ## Quick start
 
@@ -59,13 +59,35 @@ Install PyTorch to run tensor tests (without torch those tests are skipped):
 python -m unittest discover -s tests -v
 ```
 
+### Tensor-backed paged KV blocks (v0.3)
+
+`TensorPagedKVStore` now holds **real PyTorch K/V tensors** in bounded, fixed-size blocks and tracks per-request block tables. The length-grouped backend accepts `kv_store=TensorPagedKVStore(total_blocks=..., block_size=...)`, reads contiguous cache tuples from the block store for each model forward, and writes updated caches back. Completed and cancelled requests release their block reservations.
+
+```python
+from inference_engine import TensorPagedKVStore
+from inference_engine.batched import LengthGroupedTransformersBackend
+
+store = TensorPagedKVStore(total_blocks=256, block_size=16)
+backend = LengthGroupedTransformersBackend(kv_store=store)
+```
+
+Run CPU tests without model downloads:
+
+```bash
+python -m pip install -e .
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m unittest discover -s tests -v
+```
+
+**Important limitations:** This is tensor-backed **block storage**, not vLLM-style paged attention. The backend still reconstructs *contiguous copies* of cached K/V before each ordinary model forward, so the block store may use **more** memory and compute than direct caching. Stores have fixed capacity and are not thread safe. NVIDIA CUDA correctness/performance and real model behavior are still unverified.
+
 ## Project layout
 
 ```text
 src/inference_engine/
   engine.py       # synchronous batch admission, decode steps, cancel, completion
   backend.py      # deterministic fake backend and optional Transformers model
-  kv_cache.py     # standalone paged-block metadata allocator
+  kv_cache.py     # block ID allocator\n  paged_tensors.py # bounded tensor-backed K/V block pool
   incremental.py  # per-request real KV cache incremental decode\n  batched.py      # grouped forwards for same-length requests
 examples/
   demo.py         # no-download example
@@ -73,14 +95,14 @@ examples/
   incremental_model.py # real per-request cached decoding\n  batched_model.py # batched model forward demonstration
 tests/
   test_engine.py  # 7 original unit tests
-  test_incremental.py # 3 offline lifecycle tests\n  test_batched.py # 5 tensor-level batch/cache tests (requires torch)
+  test_incremental.py # 3 offline lifecycle tests\n  test_batched.py # 5 tensor-level batch/cache tests (requires torch)\n  test_paged_tensors.py # 6 block-storage and integration tests
 ```
 
 ## Technical details
 
 - `ContinuousBatchEngine` admits pending requests whenever slots become available, including between generation steps.
 - Supports per-request output length caps, duplicate ID detection, cancellation and EOS completion.
-- `BlockAllocator` reserves and releases integer block IDs in block tables. It does not hold actual GPU tensors or control model memory.
+- `BlockAllocator` reserves and releases integer IDs; `TensorPagedKVStore` stores actual K/V tensors on its configured torch device, but does not implement paged attention.
 - The synchronous scheduler is not thread-safe and does not expose a production HTTP service.
 
 
