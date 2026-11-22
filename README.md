@@ -1,8 +1,8 @@
 # LLM Inference Engine — Educational MVP
 
-A runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block allocator with real tensor storage**, optional Hugging Face Transformers generation backends, **length-grouped real tensor batching**, and attention correctness/benchmark baselines.
+A runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block allocator with real tensor storage**, optional Hugging Face Transformers generation backends, **length-grouped real tensor batching**, attention correctness/benchmark baselines, and greedy speculative decoding.
 
-> **Implementation status:** This repository is an educational prototype, **not** a production GPU inference engine. The optional tensor block store is connected to the length-grouped backend, but reconstructs contiguous KV caches for ordinary attention. There are no custom CUDA kernels, GPU paged attention, prefix sharing, speculative decoding, or validated Qwen3-8B performance claims in this version.
+> **Implementation status:** This repository is an educational prototype, **not** a production GPU inference engine. The optional tensor block store is connected to the length-grouped backend, but reconstructs contiguous KV caches for ordinary attention. Greedy speculative decoding is included as a standalone proof-of-concept. There are no custom CUDA kernels, GPU paged attention, prefix sharing, stochastic speculative sampling, or validated Qwen3-8B performance claims.
 
 ## Quick start
 
@@ -102,6 +102,28 @@ python benchmarks/attention.py --device cuda --iterations 100 --warmup 20 --outp
 
 The benchmark synchronizes CUDA kernels and reports median/p95 per-call latencies in JSON alongside PyTorch version, device, dtype and shape. **These numbers are not model tokens/sec, and do not establish Qwen3-8B or custom-CUDA performance gains.** The reference is educational and is not guaranteed to be faster than PyTorch SDPA.
 
+### Greedy speculative decoding (v0.5)
+
+`speculative_greedy` implements draft-model proposal, target block verification,
+early rejection, target correction, bonus token, EOS handling and strict token budgets.
+Accepted draft tokens must agree with the target's greedy predictions, so outputs
+match ordinary deterministic greedy decoding.
+
+```bash
+python examples/speculative_demo.py
+python -m unittest discover -s tests -p 'test_speculative*.py' -v
+```
+
+The optional `HuggingFaceGreedyAdapter` verifies multiple proposal positions in
+one full-context causal LM forward. Draft generation still uses sequential calls.
+Models must share compatible token IDs.
+
+**Limitations:** This is greedy decoding only, not probabilistic rejection
+sampling for arbitrary sampling temperatures. It does not reuse persistent KV
+caches, integrate with the request scheduler, or demonstrate an end-to-end
+speedup. Fewer target forwards alone are not evidence of faster generation.
+Real-model GPU benchmarking and Qwen3-8B validation remain future work.
+
 ## Project layout
 
 ```text
@@ -111,6 +133,7 @@ src/inference_engine/
   kv_cache.py     # block ID allocator
   paged_tensors.py # bounded tensor-backed K/V block pool
   attention.py    # reference attention + torch SDPA parity
+  speculative.py  # greedy draft/target verification
   incremental.py  # per-request real KV cache incremental decode
   batched.py      # grouped forwards for same-length requests
 examples/
@@ -118,12 +141,15 @@ examples/
   real_model.py   # original recomputation example
   incremental_model.py # real per-request cached decoding
   batched_model.py # batched model forward demonstration
+  speculative_demo.py # no-download speculative decoding example
 tests/
   test_engine.py  # 7 original unit tests
   test_incremental.py # 3 offline lifecycle tests
   test_batched.py # 5 tensor-level batch/cache tests (requires torch)
   test_paged_tensors.py # 6 block-storage and integration tests
   test_attention.py # 7 attention correctness/gradient tests
+  test_speculative.py # 11 greedy parity/rejection/EOS tests
+  test_speculative_torch.py # torch mock causal LM verification test
 benchmarks/
   attention.py  # CPU/CUDA attention microbenchmark
 ```
@@ -134,7 +160,3 @@ benchmarks/
 - Supports per-request output length caps, duplicate ID detection, cancellation and EOS completion.
 - `BlockAllocator` reserves and releases integer IDs; `TensorPagedKVStore` stores actual K/V tensors on its configured torch device, but does not implement paged attention.
 - The synchronous scheduler is not thread-safe and does not expose a production HTTP service.
-
-
-
-
