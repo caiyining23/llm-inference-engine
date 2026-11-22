@@ -1,12 +1,47 @@
-# LLM Inference Engine — Educational MVP
+# LLM Inference Engine
 
-A runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block allocator with real tensor storage**, optional Hugging Face Transformers generation backends, **length-grouped real tensor batching**, attention correctness/benchmark baselines, and greedy speculative decoding.
+A modular LLM inference framework built with **Python and PyTorch**, featuring continuous request scheduling, transformer KV-cache management, batched generation, attention benchmarking, and greedy speculative decoding.
 
-> **Implementation status:** This repository is an educational prototype, **not** a production GPU inference engine. The optional tensor block store is connected to the length-grouped backend, but reconstructs contiguous KV caches for ordinary attention. Greedy speculative decoding is included as a standalone proof-of-concept. There are no custom CUDA kernels, GPU paged attention, prefix sharing, stochastic speculative sampling, or validated Qwen3-8B performance claims.
+## Features
 
-## Quick start
+- **Continuous request scheduling:** FIFO admission, configurable batch size, per-request generation limits, cancellation, and completion tracking.
+- **Incremental generation:** Transformer decoding with `past_key_values` and explicit cache lifecycle management.
+- **Batched inference:** One model forward pass per group of requests sharing the same sequence length; per-request cache tensors are merged and separated along the batch dimension.
+- **Block-based KV storage:** A bounded PyTorch K/V tensor pool with configurable block size, per-request block tables, allocation, and reclamation.
+- **Attention implementations:** An explicit causal attention reference and a PyTorch scaled-dot-product attention implementation using suffix-aligned masks for incremental decoding.
+- **Speculative decoding:** Draft-token proposals, batched target verification, acceptance/rejection, and greedy-output consistency.
+- **Testing and profiling:** Deterministic unit tests, tensor-level integration tests, continuous integration, and CPU/CUDA attention microbenchmarks.
 
-Requires Python 3.10+.
+## Architecture
+
+```text
+                       Generation Requests
+                                |
+                      ContinuousBatchEngine
+                       /        |         \
+                Admission   Scheduling   Cancellation
+                       \        |         /
+                         Model Backend
+                   /         |           \
+              Incremental  Length-grouped  Greedy speculative
+                decoding     batching         decoding
+                                |
+                          KV Tensor Store
+                          Block Allocator
+                                |
+                       PyTorch Attention
+                       Reference / SDPA
+```
+
+The scheduler and generation backends are designed as separate components. The tensor store uses fixed-size blocks and reconstructs ordinary contiguous K/V tensors for model forwards; attention execution uses PyTorch operations.
+
+## Requirements
+
+- Python 3.10+
+- PyTorch for tensor operations and attention tests
+- Hugging Face Transformers for model-backed generation
+
+## Installation
 
 ```bash
 git clone https://github.com/caiyining23/llm-inference-engine.git
@@ -14,149 +49,103 @@ cd llm-inference-engine
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
+```
+
+For model-backed generation:
+
+```bash
+python -m pip install -e ".[model]"
+```
+
+## Usage
+
+### Request scheduling
+
+```bash
 python examples/demo.py
-python -m unittest discover -s tests -v
 ```
 
-The demo uses a deterministic fake token generator and runs without a GPU.
-
-### Optional real language model
-
-This example downloads a tiny causal language model from Hugging Face and can run on CPU (slowly):
+### Transformer decoding
 
 ```bash
-python -m pip install -e ".[model]"
 python examples/real_model.py
-```
-
-The Transformers backend **recomputes all input tokens at each step** instead of using an optimized incremental KV cache.
-
-### Incremental model backend (new)
-
-A per-request `IncrementalTransformersBackend` now uses real Hugging Face `past_key_values`: a full-prompt prefill occurs once, and later steps feed only the newest token while retaining the attention cache. Caches are released when requests complete or are cancelled.
-
-```bash
-python -m pip install -e ".[model]"
 python examples/incremental_model.py
-```
-
-**Limitations:** This is per-request incremental decoding, **not** true GPU batched forward execution. Dynamic request admission occurs at the scheduler level. The original `TransformersBackend` still uses full-context recomputation. The real-model example requires downloading model weights and has not been validated with a GPU in this environment.
-
-### Length-grouped batched model forwards (v0.2)
-
-The `LengthGroupedTransformersBackend` combines multiple requests into a **single model forward** when their prefill lengths or processed KV-cache lengths are equal. It concatenates their actual model KV tensors along the batch dimension, decodes, then splits the resulting caches back into per-request tensors. Requests of **different** lengths are executed in separate groups: this is **not** arbitrary-length continuous batching or paged attention.
-
-```bash
-python -m pip install -e ".[model]"
 python examples/batched_model.py
 ```
 
-The optional dependency constrains Transformers to `>=4.45,<4.50` for the legacy tuple KV-cache interface. The offline deterministic PyTorch tests validate tensor grouping and cache lifecycles; **real-model generation and GPU performance need environment-specific validation**.
+The model examples use a small Hugging Face causal language model. The incremental backend reuses per-request `past_key_values`; the length-grouped backend merges requests with compatible cached sequence lengths.
 
-Install PyTorch to run tensor tests (without torch those tests are skipped):
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-### Tensor-backed paged KV blocks (v0.3)
-
-`TensorPagedKVStore` now holds **real PyTorch K/V tensors** in bounded, fixed-size blocks and tracks per-request block tables. The length-grouped backend accepts `kv_store=TensorPagedKVStore(total_blocks=..., block_size=...)`, reads contiguous cache tuples from the block store for each model forward, and writes updated caches back. Completed and cancelled requests release their block reservations.
+### KV block storage
 
 ```python
-from inference_engine import TensorPagedKVStore
+from inference_engine.paged_tensors import TensorPagedKVStore
 from inference_engine.batched import LengthGroupedTransformersBackend
 
 store = TensorPagedKVStore(total_blocks=256, block_size=16)
 backend = LengthGroupedTransformersBackend(kv_store=store)
 ```
 
-Run CPU tests without model downloads:
+The block store manages actual PyTorch Key/Value tensors and releases request allocations when decoding completes or is cancelled.
 
-```bash
-python -m pip install -e .
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python -m unittest discover -s tests -v
-```
-
-**Important limitations:** This is tensor-backed **block storage**, not vLLM-style paged attention. The backend still reconstructs *contiguous copies* of cached K/V before each ordinary model forward, so the block store may use **more** memory and compute than direct caching. Stores have fixed capacity and are not thread safe. NVIDIA CUDA correctness/performance and real model behavior are still unverified.
-
-### Attention correctness and benchmarking (v0.4)
-
-`src/inference_engine/attention.py` provides two independent Attention implementations:
-
-- `reference_attention`: explicit FP32 score accumulation + masked softmax + value aggregation.
-- `sdpa_attention`: PyTorch's `scaled_dot_product_attention`, with an explicit **bottom-right suffix-aligned causal mask** so incremental one-token and chunked decoding have correct causal semantics.
-
-The implementations are compared in `tests/test_attention.py` on CPU for prefill, one-token decode, chunked decode, gradient parity, and future-token leakage.
-
-Run a reproducible **attention-only** microbenchmark:
-
-```bash
-python -m pip install -e .
-python -m pip install torch
-python benchmarks/attention.py --device cpu --iterations 30
-# Only if an NVIDIA CUDA GPU is installed:
-python benchmarks/attention.py --device cuda --iterations 100 --warmup 20 --output attention-results.json
-```
-
-The benchmark synchronizes CUDA kernels and reports median/p95 per-call latencies in JSON alongside PyTorch version, device, dtype and shape. **These numbers are not model tokens/sec, and do not establish Qwen3-8B or custom-CUDA performance gains.** The reference is educational and is not guaranteed to be faster than PyTorch SDPA.
-
-### Greedy speculative decoding (v0.5)
-
-`speculative_greedy` implements draft-model proposal, target block verification,
-early rejection, target correction, bonus token, EOS handling and strict token budgets.
-Accepted draft tokens must agree with the target's greedy predictions, so outputs
-match ordinary deterministic greedy decoding.
+### Greedy speculative decoding
 
 ```bash
 python examples/speculative_demo.py
-python -m unittest discover -s tests -p 'test_speculative*.py' -v
 ```
 
-The optional `HuggingFaceGreedyAdapter` verifies multiple proposal positions in
-one full-context causal LM forward. Draft generation still uses sequential calls.
-Models must share compatible token IDs.
+The speculative decoder checks draft proposals against target-model greedy predictions, accepts matching tokens and applies target corrections on mismatch. `HuggingFaceGreedyAdapter` supports full-context block verification with causal language models.
 
-**Limitations:** This is greedy decoding only, not probabilistic rejection
-sampling for arbitrary sampling temperatures. It does not reuse persistent KV
-caches, integrate with the request scheduler, or demonstrate an end-to-end
-speedup. Fewer target forwards alone are not evidence of faster generation.
-Real-model GPU benchmarking and Qwen3-8B validation remain future work.
+## Tests
 
-## Project layout
+Run the core unit tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+To include tensor-level tests, install PyTorch first:
+
+```bash
+python -m pip install torch
+python -m unittest discover -s tests -v
+```
+
+GitHub Actions runs standard unit tests and CPU PyTorch tests on pushes and pull requests.
+
+Tests cover request admission, cancellation, KV allocation and reclamation, tensor round trips, batched generation, attention parity, causal masking, gradients, and speculative greedy-output consistency.
+
+## Attention Benchmark
+
+```bash
+python benchmarks/attention.py --device cpu --iterations 30
+```
+
+On an NVIDIA CUDA environment:
+
+```bash
+python benchmarks/attention.py --device cuda --warmup 20 --iterations 100 --output attention-results.json
+```
+
+The benchmark reports reference attention and PyTorch SDPA execution timings, including median and P95 latency, plus device, dtype, framework version, and input dimensions. These results represent **attention microbenchmarks**, not end-to-end model tokens/second.
+
+## Project Structure
 
 ```text
 src/inference_engine/
-  engine.py       # synchronous batch admission, decode steps, cancel, completion
-  backend.py      # deterministic fake backend and optional Transformers model
-  kv_cache.py     # block ID allocator
-  paged_tensors.py # bounded tensor-backed K/V block pool
-  attention.py    # reference attention + torch SDPA parity
-  speculative.py  # greedy draft/target verification
-  incremental.py  # per-request real KV cache incremental decode
-  batched.py      # grouped forwards for same-length requests
-examples/
-  demo.py         # no-download example
-  real_model.py   # original recomputation example
-  incremental_model.py # real per-request cached decoding
-  batched_model.py # batched model forward demonstration
-  speculative_demo.py # no-download speculative decoding example
-tests/
-  test_engine.py  # 7 original unit tests
-  test_incremental.py # 3 offline lifecycle tests
-  test_batched.py # 5 tensor-level batch/cache tests (requires torch)
-  test_paged_tensors.py # 6 block-storage and integration tests
-  test_attention.py # 7 attention correctness/gradient tests
-  test_speculative.py # 11 greedy parity/rejection/EOS tests
-  test_speculative_torch.py # torch mock causal LM verification test
-benchmarks/
-  attention.py  # CPU/CUDA attention microbenchmark
+  engine.py             Request lifecycle and continuous scheduler
+  backend.py            Fake and Transformers model backends
+  incremental.py        Cached autoregressive decoding
+  batched.py            Length-grouped batched generation
+  kv_cache.py           Block allocation metadata
+  paged_tensors.py      Fixed-block PyTorch KV tensor storage
+  attention.py          Reference attention and PyTorch SDPA
+  speculative.py        Greedy speculative decoding
+examples/               Runnable generation examples
+tests/                  Unit and tensor integration tests
+benchmarks/             Attention timing and output reports
+.github/workflows/      Continuous integration
 ```
 
-## Technical details
+## License
 
-- `ContinuousBatchEngine` admits pending requests whenever slots become available, including between generation steps.
-- Supports per-request output length caps, duplicate ID detection, cancellation and EOS completion.
-- `BlockAllocator` reserves and releases integer IDs; `TensorPagedKVStore` stores actual K/V tensors on its configured torch device, but does not implement paged attention.
-- The synchronous scheduler is not thread-safe and does not expose a production HTTP service.
+MIT.
