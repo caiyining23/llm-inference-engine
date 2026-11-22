@@ -46,14 +46,21 @@ class ContinuousBatchEngine:
         self._ids.add(request.request_id)
         self.pending.append(request)
 
+    def _release_backend(self, request_id: str) -> None:
+        release = getattr(self.backend, "release", None)
+        if callable(release):
+            release(request_id)
+
     def cancel(self, request_id: str) -> bool:
         active = self.active.pop(request_id, None)
         if active is not None:
+            self._release_backend(request_id)
             self.completed.append(GenerationResult(request_id, active.tokens.copy(), "cancelled"))
             return True
         for req in self.pending:
             if req.request_id == request_id:
                 self.pending.remove(req)
+                self._release_backend(request_id)
                 self.completed.append(GenerationResult(request_id, [], "cancelled"))
                 return True
         return False
@@ -66,7 +73,14 @@ class ContinuousBatchEngine:
             return []
         members = list(self.active.items())
         sequences = [state.request.prompt_tokens + state.tokens for _, state in members]
-        generated = self.backend.next_tokens(sequences)
+        by_id = getattr(self.backend, "next_tokens_by_id", None)
+        if callable(by_id):
+            generated = by_id([
+                (request_id, sequence)
+                for (request_id, _), sequence in zip(members, sequences)
+            ])
+        else:
+            generated = self.backend.next_tokens(sequences)
         if len(generated) != len(members):
             raise RuntimeError("backend returned incorrect batch size")
         finished = []
@@ -80,6 +94,7 @@ class ContinuousBatchEngine:
             if reason:
                 finished.append(GenerationResult(request_id, state.tokens.copy(), reason))
                 del self.active[request_id]
+                self._release_backend(request_id)
         self.completed.extend(finished)
         self.steps += 1
         return finished
