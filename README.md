@@ -66,18 +66,6 @@ tests/
 - `BlockAllocator` reserves and releases integer block IDs in block tables. It does not hold actual GPU tensors or control model memory.
 - The synchronous scheduler is not thread-safe and does not expose a production HTTP service.
 
-## Future work
 
-- Implement batched GPU forwards across requests with heterogeneous cached lengths.
-- Integrate KV-block allocation with actual attention memory.
-- Add streaming responses, async admission and backpressure.
-- Benchmark on specified hardware with reproducible tokens/sec, P50/P95 latency and memory results.
-- Explore Qwen3-8B and speculative decoding after validating an actual GPU serving backend.
 
-## Resume/portfolio accuracy
 
-This repository **does not substantiate** the claimed throughput, latency or CUDA optimization figures that may appear in a separate resume. Only include features and measurements after implementing and reproducing them.
-
-## License
-
-MIT.
