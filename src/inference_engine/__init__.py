@@ -5,4 +5,5 @@ from .kv_cache import BlockAllocator
 from .paged_tensors import TensorPagedKVStore
 from .incremental import IncrementalTransformersBackend
 
-__all__ = ["ContinuousBatchEngine", "Request", "GenerationResult", "FakeBackend", "TransformersBackend", "BlockAllocator", "TensorPagedKVStore", "IncrementalTransformersBackend"]
+__all__ = ["ContinuousBatchEngine", "Request", "GenerationResult", "FakeBackend", "TransformersBackend", "BlockAllocator", "TensorPagedKVStore", "IncrementalTransformersBackend", "speculative_greedy", "greedy_decode", "SpeculativeResult", "HuggingFaceGreedyAdapter"]
+from .speculative import speculative_greedy, greedy_decode, SpeculativeResult, HuggingFaceGreedyAdapter
