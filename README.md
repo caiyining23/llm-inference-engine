@@ -1,6 +1,6 @@
 # LLM Inference Engine — Educational MVP
 
-A runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block metadata allocator**, optional Hugging Face Transformers generation backends, and **length-grouped real tensor batching**.
+A runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block allocator with real tensor storage**, optional Hugging Face Transformers generation backends, **length-grouped real tensor batching**, and attention correctness/benchmark baselines.
 
 > **Implementation status:** This repository is an educational prototype, **not** a production GPU inference engine. The optional tensor block store is connected to the length-grouped backend, but reconstructs contiguous KV caches for ordinary attention. There are no custom CUDA kernels, GPU paged attention, prefix sharing, speculative decoding, or validated Qwen3-8B performance claims in this version.
 
@@ -81,21 +81,51 @@ python -m unittest discover -s tests -v
 
 **Important limitations:** This is tensor-backed **block storage**, not vLLM-style paged attention. The backend still reconstructs *contiguous copies* of cached K/V before each ordinary model forward, so the block store may use **more** memory and compute than direct caching. Stores have fixed capacity and are not thread safe. NVIDIA CUDA correctness/performance and real model behavior are still unverified.
 
+### Attention correctness and benchmarking (v0.4)
+
+`src/inference_engine/attention.py` provides two independent Attention implementations:
+
+- `reference_attention`: explicit FP32 score accumulation + masked softmax + value aggregation.
+- `sdpa_attention`: PyTorch's `scaled_dot_product_attention`, with an explicit **bottom-right suffix-aligned causal mask** so incremental one-token and chunked decoding have correct causal semantics.
+
+The implementations are compared in `tests/test_attention.py` on CPU for prefill, one-token decode, chunked decode, gradient parity, and future-token leakage.
+
+Run a reproducible **attention-only** microbenchmark:
+
+```bash
+python -m pip install -e .
+python -m pip install torch
+python benchmarks/attention.py --device cpu --iterations 30
+# Only if an NVIDIA CUDA GPU is installed:
+python benchmarks/attention.py --device cuda --iterations 100 --warmup 20 --output attention-results.json
+```
+
+The benchmark synchronizes CUDA kernels and reports median/p95 per-call latencies in JSON alongside PyTorch version, device, dtype and shape. **These numbers are not model tokens/sec, and do not establish Qwen3-8B or custom-CUDA performance gains.** The reference is educational and is not guaranteed to be faster than PyTorch SDPA.
+
 ## Project layout
 
 ```text
 src/inference_engine/
   engine.py       # synchronous batch admission, decode steps, cancel, completion
   backend.py      # deterministic fake backend and optional Transformers model
-  kv_cache.py     # block ID allocator\n  paged_tensors.py # bounded tensor-backed K/V block pool
-  incremental.py  # per-request real KV cache incremental decode\n  batched.py      # grouped forwards for same-length requests
+  kv_cache.py     # block ID allocator
+  paged_tensors.py # bounded tensor-backed K/V block pool
+  attention.py    # reference attention + torch SDPA parity
+  incremental.py  # per-request real KV cache incremental decode
+  batched.py      # grouped forwards for same-length requests
 examples/
   demo.py         # no-download example
   real_model.py   # original recomputation example
-  incremental_model.py # real per-request cached decoding\n  batched_model.py # batched model forward demonstration
+  incremental_model.py # real per-request cached decoding
+  batched_model.py # batched model forward demonstration
 tests/
   test_engine.py  # 7 original unit tests
-  test_incremental.py # 3 offline lifecycle tests\n  test_batched.py # 5 tensor-level batch/cache tests (requires torch)\n  test_paged_tensors.py # 6 block-storage and integration tests
+  test_incremental.py # 3 offline lifecycle tests
+  test_batched.py # 5 tensor-level batch/cache tests (requires torch)
+  test_paged_tensors.py # 6 block-storage and integration tests
+  test_attention.py # 7 attention correctness/gradient tests
+benchmarks/
+  attention.py  # CPU/CUDA attention microbenchmark
 ```
 
 ## Technical details
