@@ -1,6 +1,6 @@
 # LLM Inference Engine — Educational MVP
 
-A tested, runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block metadata allocator**, and an optional Hugging Face Transformers generation backend.
+A runnable Python prototype implementing **continuous-batching request scheduling**, a **paged KV block metadata allocator**, and an optional Hugging Face Transformers generation backend.
 
 > **Implementation status:** This repository is an educational prototype, **not** a production GPU inference engine. The metadata allocator is not connected to attention KV tensors. There are no custom CUDA kernels, GPU paged attention, prefix sharing, speculative decoding, or validated Qwen3-8B performance claims in this version.
 
@@ -9,8 +9,8 @@ A tested, runnable Python prototype implementing **continuous-batching request s
 Requires Python 3.10+.
 
 ```bash
-git clone https://github.com/caiyining23/lm-inference-engine.git
-cd lm-inference-engine
+git clone https://github.com/caiyining23/llm-inference-engine.git
+cd llm-inference-engine
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
@@ -31,6 +31,17 @@ python examples/real_model.py
 
 The Transformers backend **recomputes all input tokens at each step** instead of using an optimized incremental KV cache.
 
+### Incremental model backend (new)
+
+A per-request `IncrementalTransformersBackend` now uses real Hugging Face `past_key_values`: a full-prompt prefill occurs once, and later steps feed only the newest token while retaining the attention cache. Caches are released when requests complete or are cancelled.
+
+```bash
+python -m pip install -e ".[model]"
+python examples/incremental_model.py
+```
+
+**Limitations:** This is per-request incremental decoding, **not** true GPU batched forward execution. Dynamic request admission occurs at the scheduler level. The original `TransformersBackend` still uses full-context recomputation. The real-model example requires downloading model weights and has not been validated with a GPU in this environment.
+
 ## Project layout
 
 ```text
@@ -38,11 +49,14 @@ src/inference_engine/
   engine.py       # synchronous batch admission, decode steps, cancel, completion
   backend.py      # deterministic fake backend and optional Transformers model
   kv_cache.py     # standalone paged-block metadata allocator
+  incremental.py  # per-request real KV cache incremental decode
 examples/
   demo.py         # no-download example
-  real_model.py   # optional Hugging Face example
+  real_model.py   # original recomputation example
+  incremental_model.py # real per-request cached decoding
 tests/
-  test_engine.py  # 7 unit tests
+  test_engine.py  # 7 original unit tests
+  test_incremental.py # 3 offline lifecycle tests
 ```
 
 ## Technical details
@@ -54,7 +68,7 @@ tests/
 
 ## Future work
 
-- Build real incremental prefill/decode with per-request cached model states.
+- Implement batched GPU forwards across requests with heterogeneous cached lengths.
 - Integrate KV-block allocation with actual attention memory.
 - Add streaming responses, async admission and backpressure.
 - Benchmark on specified hardware with reproducible tokens/sec, P50/P95 latency and memory results.
